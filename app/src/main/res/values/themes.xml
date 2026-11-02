@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0B0B0C</color>
+    <color name="surface">#18181B</color>
+    <color name="line">#3F3F46</color>
+    <color name="text">#F4F4F5</color>
+    <color name="muted">#A1A1AA</color>
+    <color name="accent">#FFC21A</color>
+    <color name="ok">#86EFAC</color>
+
+    <style name="Theme.Lente" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:statusBarColor">@color/bg</item>
+        <item name="android:navigationBarColor">@color/bg</item>
+        <item name="colorAccent">@color/accent</item>
+        <item name="colorPrimary">@color/bg</item>
+        <item name="android:textColor">@color/text</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>
