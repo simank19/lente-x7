@@ -52,6 +52,16 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
 
+        <androidx.camera.view.PreviewView
+            android:id="@+id/previewFront"
+            android:layout_width="108dp"
+            android:layout_height="144dp"
+            android:layout_gravity="top|end"
+            android:layout_margin="12dp"
+            android:background="@drawable/card"
+            android:elevation="6dp"
+            android:visibility="gone" />
+
         <co.mivibra.lentex7.HistogramView
             android:id="@+id/histo"
             android:layout_width="112dp"

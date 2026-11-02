@@ -42,6 +42,9 @@ import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
+import androidx.camera.core.CameraInfo
+import androidx.camera.core.ConcurrentCamera
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageAnalysis
@@ -60,6 +63,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -82,10 +87,11 @@ import kotlin.math.tan
 @OptIn(ExperimentalCamera2Interop::class)
 class MainActivity : AppCompatActivity() {
 
-    enum class Mode(val label: String) { NOCHE("NOCHE"), LUNA("LUNA"), PANO("PANO"), ESFERA("360°"), FOTO("FOTO"), MACRO("MACRO"), PRO("PRO"), COLOR("COLOR") }
+    enum class Mode(val label: String) { NOCHE("NOCHE"), LUNA("LUNA"), PANO("PANO"), ESFERA("360°"), FOTO("FOTO"), DUAL("DUAL"), MACRO("MACRO"), PRO("PRO"), COLOR("COLOR") }
 
     // Vistas
     private lateinit var previewView: PreviewView
+    private lateinit var previewFront: PreviewView
     private lateinit var overlay: OverlayView
     private lateinit var histo: HistogramView
     private lateinit var txtInfo: TextView
@@ -118,6 +124,13 @@ class MainActivity : AppCompatActivity() {
     private var currentId: String? = null
     private var extensionActive = false
     private var mainMinZoom = 1f
+    private var frontId: String? = null
+    private var concurrentPair: List<CameraInfo>? = null
+    private var concurrentActive = false
+    private var frontCapture: ImageCapture? = null
+    private lateinit var frontExecutor: ExecutorService
+    private var dualTrio = false
+    private var dualSide = false
 
     // Estado
     private var mode = Mode.FOTO
@@ -201,6 +214,10 @@ class MainActivity : AppCompatActivity() {
         btnGrid = findViewById(R.id.btnGrid)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
+        frontExecutor = Executors.newSingleThreadExecutor()
+        previewFront = findViewById(R.id.previewFront)
+        previewFront.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        previewFront.clipToOutline = true
         camManager = getSystemService(CAMERA_SERVICE) as CameraManager
         motion = Motion(this)
         motion.onLevel = { r -> runOnUiThread { overlay.rollDeg = r } }
@@ -287,6 +304,75 @@ class MainActivity : AppCompatActivity() {
         uwId = backs.filter { it.first != mainId && it.second < mainEq * 0.8f }.minByOrNull { it.second }?.first
         mainMinZoom = chars(mainId)?.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.lower ?: 1f
         currentId = mainId
+        frontId = p.availableCameraInfos.map { Camera2CameraInfo.from(it) }
+            .firstOrNull { it.getCameraCharacteristic(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT }?.cameraId
+        concurrentPair = try {
+            p.availableConcurrentCameraInfos.firstOrNull { l -> l.any { facing(it) == CameraCharacteristics.LENS_FACING_BACK } && l.any { facing(it) == CameraCharacteristics.LENS_FACING_FRONT } }
+        } catch (_: Throwable) { null }
+    }
+
+    private fun facing(info: CameraInfo): Int? = Camera2CameraInfo.from(info).getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
+
+    private fun simpleCapture(): ImageCapture = ImageCapture.Builder()
+        .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+        .setResolutionSelector(
+            ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                .setResolutionFilter { sizes, _ -> sizes.filter { it.width.toLong() * it.height <= 13_000_000L }.ifEmpty { sizes } }
+                .build()
+        )
+        .setFlashMode(flash)
+        .build()
+
+    /** Modo DUAL: abre trasera y frontal a la vez si el teléfono lo permite. */
+    private fun bindDual() {
+        val p = provider ?: return
+        camera?.cameraInfo?.zoomState?.removeObservers(this)
+        p.unbindAll()
+        concurrentActive = false
+        frontCapture = null
+        extensionActive = false
+        val pair = concurrentPair
+        if (pair != null) {
+            try {
+                val backInfo = pair.first { facing(it) == CameraCharacteristics.LENS_FACING_BACK }
+                val frontInfo = pair.first { facing(it) == CameraCharacteristics.LENS_FACING_FRONT }
+                val pb = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+                val cb = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).setFlashMode(flash).build()
+                val pf = Preview.Builder().build().also { it.setSurfaceProvider(previewFront.surfaceProvider) }
+                val cf = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
+                val c1 = ConcurrentCamera.SingleCameraConfig(backInfo.cameraSelector, UseCaseGroup.Builder().addUseCase(pb).addUseCase(cb).build(), this)
+                val c2 = ConcurrentCamera.SingleCameraConfig(frontInfo.cameraSelector, UseCaseGroup.Builder().addUseCase(pf).addUseCase(cf).build(), this)
+                val cc = p.bindToLifecycle(listOf(c1, c2))
+                camera = cc.cameras.firstOrNull()
+                imageCapture = cb
+                frontCapture = cf
+                concurrentActive = true
+            } catch (t: Throwable) {
+                p.unbindAll()
+                concurrentActive = false
+            }
+        }
+        if (!concurrentActive) bindSimple(mainId, 1f)
+        previewFront.visibility = if (concurrentActive) View.VISIBLE else View.GONE
+        camera?.cameraInfo?.zoomState?.observe(this) { zs -> txtZoom.text = zoomText(zs.zoomRatio) }
+        buildPanel()
+    }
+
+    /** Une una sola cámara (preview + foto), usado por el modo DUAL secuencial. */
+    private fun bindSimple(id: String?, zoom: Float): Boolean {
+        val p = provider ?: return false
+        p.unbindAll()
+        val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
+        val ic = simpleCapture()
+        return try {
+            camera = p.bindToLifecycle(this, selectorFor(id), preview, ic)
+            imageCapture = ic
+            currentId = id
+            camera?.cameraControl?.setZoomRatio(zoom)
+            true
+        } catch (_: Throwable) { false }
     }
 
     private fun selectorFor(id: String?): CameraSelector {
@@ -323,6 +409,9 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("UnsafeOptInUsageError")
     private fun bindCamera() {
         val p = provider ?: return
+        if (mode == Mode.DUAL) { bindDual(); return }
+        previewFront.visibility = View.GONE
+        concurrentActive = false
         val baseSel = selectorFor(currentId)
         val ext = if (currentId == mainId) wantedExtension() else null
         var sel = baseSel
@@ -641,6 +730,7 @@ class MainActivity : AppCompatActivity() {
             Mode.MACRO -> { currentId = mainId; wantZoom = if (macroSub == "Súper macro 4×") 4f else 2f }
             Mode.PANO -> if (panoSub == "Gran angular") pickWide() else { currentId = mainId; wantZoom = 1f }
             Mode.ESFERA -> if (sphereFast) pickWide() else { currentId = mainId; wantZoom = 1f }
+            Mode.DUAL -> { currentId = mainId; wantZoom = 1f }
             else -> if (prev in listOf(Mode.LUNA, Mode.MACRO, Mode.PANO, Mode.ESFERA) || force) { currentId = mainId; wantZoom = 1f }
         }
         refreshModeStrip()
@@ -665,6 +755,7 @@ class MainActivity : AppCompatActivity() {
             mode == Mode.NOCHE -> "NOCHE"
             mode == Mode.LUNA -> "LUNA"
             mode == Mode.MACRO -> "MACRO"
+            mode == Mode.DUAL -> "DUAL"
             else -> ""
         }
     }
@@ -721,6 +812,17 @@ class MainActivity : AppCompatActivity() {
     private fun buildPanel() {
         panel.removeAllViews()
         when (mode) {
+            Mode.DUAL -> {
+                panel.addView(chips(listOf("Dúo: trasera + frontal", "Trío: 1× + 0,6× + frontal"), if (dualTrio) "Trío: 1× + 0,6× + frontal" else "Dúo: trasera + frontal") {
+                    dualTrio = it.startsWith("Trío"); buildPanel()
+                })
+                panel.addView(chips(listOf("Recuadro", "Lado a lado"), if (dualSide) "Lado a lado" else "Recuadro") { dualSide = it == "Lado a lado"; buildPanel() })
+                panel.addView(label(
+                    if (concurrentActive) "Cámaras simultáneas: COMPATIBLE. Trasera y frontal se disparan al mismo tiempo" + (if (dualTrio) "; el 0,6× va justo después." else ".")
+                    else "Tu teléfono no deja a apps externas abrir dos cámaras a la vez: se toman una tras otra en ~1 s. Pide que posen quietos."
+                ))
+                panel.addView(label("Se guarda la foto combinada y cada cámara por separado."))
+            }
             Mode.FOTO -> {
                 panel.addView(label("Toca para enfocar · pellizca para hacer zoom"))
                 panel.addView(chips(listOf("12,5 MP procesada", "50 MP directa"), if (res50) "50 MP directa" else "12,5 MP procesada") {
@@ -857,6 +959,7 @@ class MainActivity : AppCompatActivity() {
             if (extensionActive) lines.append("\n").append(if (mode == Mode.NOCHE) "NOCHE DEL SISTEMA" else "HDR DEL SISTEMA")
         }
         txtInfo.text = lines.toString()
+        txtInfo.visibility = if (mode == Mode.DUAL) View.GONE else View.VISIBLE
         txtTripod.text = when {
             motion.tripod -> "TRÍPODE ✓"
             mode in listOf(Mode.NOCHE, Mode.LUNA, Mode.MACRO) && !motion.steady -> "MOVIMIENTO"
@@ -882,6 +985,7 @@ class MainActivity : AppCompatActivity() {
                     Mode.NOCHE -> captureNight()
                     Mode.LUNA -> captureMoon()
                     Mode.MACRO -> captureMacro()
+                    Mode.DUAL -> captureDual()
                     else -> captureNormal()
                 }
             } catch (t: Throwable) {
@@ -924,6 +1028,59 @@ class MainActivity : AppCompatActivity() {
         bmp.recycle()
         center(null)
         toast("Guardada en Imágenes/LenteX7")
+    }
+
+    /** Toma, guarda por separado y devuelve una copia reducida para la composición. */
+    private suspend fun keep(b: Bitmap, tag: String, mirror: Boolean = false): Bitmap = withContext(Dispatchers.Default) {
+        var x = b
+        if (mirror) x = Compose.mirror(x)
+        ColorEngine.apply(x, color)
+        CamUtil.save(this@MainActivity, x, tag)
+        CamUtil.scaleTo(x, 3000)
+    }
+
+    private suspend fun captureDual() {
+        flashScreen()
+        val back: Bitmap
+        val front: Bitmap
+        var wide: Bitmap? = null
+        if (concurrentActive && frontCapture != null) {
+            center("Disparando ambas cámaras")
+            val pair = coroutineScope {
+                val a = async { shot() }
+                val f = async { CamUtil.takeBitmap(frontCapture!!, frontExecutor) }
+                a.await() to f.await()
+            }
+            back = pair.first; front = pair.second
+        } else {
+            center("Trasera…")
+            back = shot()
+            center("¡Ahora la frontal!")
+            if (!bindSimple(frontId, 1f)) throw IllegalStateException("No se pudo abrir la cámara frontal")
+            delay(700)
+            front = shot()
+        }
+        center("Guardando…")
+        val b1 = keep(back, "DUAL_TRASERA")
+        val f1 = keep(front, "DUAL_FRONTAL", mirror = true)
+        if (dualTrio) {
+            center("Gran angular…")
+            val ok = if (mainMinZoom < 1f) bindSimple(mainId, max(mainMinZoom, 0.6f)) else if (uwId != null) bindSimple(uwId, 1f) else false
+            if (ok) { delay(700); wide = keep(shot(), "DUAL_GRAN_ANGULAR") }
+            else toast("El gran angular no está disponible para apps externas")
+        }
+        center("Combinando…")
+        val list = listOfNotNull(b1, wide, f1)
+        val out = withContext(Dispatchers.Default) {
+            if (dualSide) Compose.sideBySide(list) else Compose.pip(b1, listOfNotNull(wide, f1))
+        }
+        list.forEach { it.recycle() }
+        bindCamera()
+        lastUri = withContext(Dispatchers.Default) { CamUtil.save(this@MainActivity, out, "DUAL") }
+        thumb.setImageBitmap(Bitmap.createScaledBitmap(out, 160, max(1, 160 * out.height / out.width), true))
+        out.recycle()
+        center(null)
+        toast("Guardadas: combinada + cada cámara")
     }
 
     private suspend fun captureNormal() {
