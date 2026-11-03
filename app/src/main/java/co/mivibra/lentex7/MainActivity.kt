@@ -43,6 +43,10 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
+import androidx.camera.core.CameraState
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.lifecycle.Observer
 import androidx.camera.core.ConcurrentCamera
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.CameraSelector
@@ -157,7 +161,7 @@ class MainActivity : AppCompatActivity() {
     // Submodos
     private var nightSub = "Mano"
     private var moonZoom = 10f
-    private var moonExp = 4_000_000L // 1/250 s
+    private var moonExp = 0L // 0 = automático (medición puntual sobre la Luna)
     private var panoSub = "Horizontal"
     private var sphereFast = true
     private var macroSub = "Macro 2×"
@@ -192,6 +196,12 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        // Android 15 dibuja bajo las barras del sistema: se reserva su espacio.
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.root)) { v, insets ->
+            val b = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            v.setPadding(b.left, b.top, b.right, b.bottom)
+            insets
+        }
         previewView = findViewById(R.id.preview)
         overlay = findViewById(R.id.overlay)
         histo = findViewById(R.id.histo)
@@ -370,7 +380,7 @@ class MainActivity : AppCompatActivity() {
             camera = p.bindToLifecycle(this, selectorFor(id), preview, ic)
             imageCapture = ic
             currentId = id
-            camera?.cameraControl?.setZoomRatio(zoom)
+            camera?.let { c -> whenOpen(c) { c.cameraControl.setZoomRatio(zoom) } }
             true
         } catch (_: Throwable) { false }
     }
@@ -487,11 +497,47 @@ class MainActivity : AppCompatActivity() {
             txtZoom.text = zoomText(zs.zoomRatio)
             syncZoomSeek()
         }
-        bound.cameraControl.setZoomRatio(wantZoom)
-        bound.cameraControl.enableTorch(torch && mode == Mode.MACRO)
-        if (mode == Mode.PRO && proIso == null && proExp == null) bound.cameraControl.setExposureCompensationIndex(proEv)
         applyCaptureOptions()
         buildLensRow()
+        // El zoom, la linterna y la medición solo se aceptan cuando la cámara ya está abierta.
+        whenOpen(bound) {
+            bound.cameraControl.setZoomRatio(wantZoom)
+            bound.cameraControl.enableTorch(torch && mode == Mode.MACRO)
+            when {
+                mode == Mode.PRO && proIso == null && proExp == null -> bound.cameraControl.setExposureCompensationIndex(proEv)
+                mode == Mode.LUNA && moonExp == 0L -> moonMetering()
+                else -> bound.cameraControl.setExposureCompensationIndex(0)
+            }
+            applyCaptureOptions()
+            lensRow.postDelayed({ buildLensRow() }, 200)
+        }
+    }
+
+    private var bindGen = 0
+
+    private fun whenOpen(cam: Camera, action: () -> Unit) {
+        val gen = ++bindGen
+        val live = cam.cameraInfo.cameraState
+        val obs = object : Observer<CameraState> {
+            override fun onChanged(value: CameraState) {
+                if (gen != bindGen) { live.removeObserver(this); return }
+                if (value.type == CameraState.Type.OPEN) { live.removeObserver(this); action() }
+            }
+        }
+        live.observe(this, obs)
+    }
+
+    /** Luna en automático: mide la luz solo en el centro (donde va la Luna) y baja 1 paso para no quemarla. */
+    private fun moonMetering() {
+        val cam = camera ?: return
+        val f = androidx.camera.core.SurfaceOrientedMeteringPointFactory(1f, 1f)
+        val pt = f.createPoint(0.5f, 0.5f, 0.12f)
+        try {
+            cam.cameraControl.startFocusAndMetering(FocusMeteringAction.Builder(pt, FocusMeteringAction.FLAG_AE).disableAutoCancel().build())
+            val step = cam.cameraInfo.exposureState.exposureCompensationStep.toFloat()
+            val r = cam.cameraInfo.exposureState.exposureCompensationRange
+            if (step > 0f) cam.cameraControl.setExposureCompensationIndex((-1f / step).roundToInt().coerceIn(r.lower, r.upper))
+        } catch (_: Throwable) {}
     }
 
     private fun syncZoomSeek() {
@@ -542,9 +588,11 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             Mode.LUNA -> {
-                b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, clampIso(64))
-                b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, clampExp(moonExp))
+                if (moonExp > 0L) {
+                    b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                    b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, clampIso(64))
+                    b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, clampExp(moonExp))
+                }
                 b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
                 b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
                 b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
@@ -844,9 +892,15 @@ class MainActivity : AppCompatActivity() {
                 panel.addView(label("Zoom"))
                 panel.addView(chips(listOf("5×", "10×", "20×"), "${moonZoom.toInt()}×") { moonZoom = it.dropLast(1).toFloat(); wantZoom = moonZoom; camera?.cameraControl?.setZoomRatio(moonZoom); buildPanel() })
                 panel.addView(label("Exposición de la Luna"))
-                val exps = linkedMapOf("1/500" to 2_000_000L, "1/250" to 4_000_000L, "1/125" to 8_000_000L, "1/60" to 16_666_666L)
-                panel.addView(chips(exps.keys.toList(), exps.entries.firstOrNull { it.value == moonExp }?.key) { moonExp = exps[it]!!; applyCaptureOptions(); buildPanel() })
-                panel.addView(label("Usa trípode. Apila 10 cuadros y aplica nitidez."))
+                val exps = linkedMapOf("Auto" to 0L, "1/500" to 2_000_000L, "1/250" to 4_000_000L, "1/125" to 8_000_000L, "1/60" to 16_666_666L)
+                panel.addView(chips(exps.keys.toList(), exps.entries.firstOrNull { it.value == moonExp }?.key) {
+                    moonExp = exps[it]!!
+                    applyCaptureOptions()
+                    if (moonExp == 0L) moonMetering() else try { camera?.cameraControl?.cancelFocusAndMetering(); camera?.cameraControl?.setExposureCompensationIndex(0) } catch (_: Throwable) {}
+                    buildPanel()
+                })
+                panel.addView(label(if (moonExp == 0L) "Auto: pon la Luna en el círculo y la app la mide sola. Si sale muy brillante, prueba 1/500." else "Manual: la pantalla se ve negra hasta que apuntes a la Luna; es normal."))
+                panel.addView(label("Usa trípode o apoya el celular. Apila 10 cuadros y aplica nitidez."))
             }
             Mode.PANO -> {
                 panel.addView(chips(listOf("Horizontal", "Vertical", "Gran angular"), panoSub) { panoSub = it; setMode(Mode.PANO) })
